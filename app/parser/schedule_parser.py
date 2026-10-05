@@ -188,7 +188,6 @@ def get_schedule(
                         "room": clean_text(room),
                         "subgroup": subgroup,
                     }
-                    print("ГРУППА:", clean_text(group))
 
                     if lesson_data not in schedule:
                         schedule.append(

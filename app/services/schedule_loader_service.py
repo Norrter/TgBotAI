@@ -1,11 +1,18 @@
-from datetime import date, timedelta
+import asyncio
+from datetime import date, datetime, timedelta
 
 from app.database.repositories import (
+    get_current_lessons,
+    get_next_lessons,
     has_schedule_for_week,
     save_schedule,
 )
 
+from app.parser.group_parser import get_group_url
 from app.parser.schedule_parser import get_schedule
+
+
+INSTITUTE_URL = "https://www.istu.edu/raspisanie/"
 
 
 async def ensure_week_loaded(
@@ -52,11 +59,33 @@ async def ensure_week_loaded(
     )
 
 
-    # Если URL группы нет
+    # Если URL группы не передали — находим его сами
+    # (сначала в кэше, затем на сайте).
+    # Запросы к сайту блокирующие, поэтому выполняем
+    # их в отдельном потоке, чтобы бот не зависал.
+    if not group_url:
+
+        try:
+
+            group_url = await asyncio.to_thread(
+                get_group_url,
+                INSTITUTE_URL,
+                group_name,
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ Ошибка поиска группы: {e}"
+            )
+
+            return 0
+
+
     if not group_url:
 
         print(
-            "❌ Не передан URL группы"
+            f"❌ Не найден URL группы {group_name}"
         )
 
         return 0
@@ -70,7 +99,8 @@ async def ensure_week_loaded(
 
     try:
 
-        schedule = get_schedule(
+        schedule = await asyncio.to_thread(
+            get_schedule,
             group_url=group_url,
             target_date=week_start,
         )
@@ -124,3 +154,76 @@ async def ensure_week_loaded(
 
 
     return len(schedule)
+
+
+# На сколько недель вперёд (кроме текущей)
+# искать ближайшую пару
+NEXT_LESSON_WEEKS_AHEAD = 2
+
+
+async def find_current_lessons(
+    group_name: str,
+    now: datetime | None = None,
+):
+    """
+    Пары, которые идут прямо сейчас.
+    При необходимости загружает текущую неделю с сайта.
+    """
+
+    now = now or datetime.now()
+
+    await ensure_week_loaded(
+        group_name=group_name,
+        target_date=now.date(),
+    )
+
+    return await get_current_lessons(
+        group_name,
+        now,
+    )
+
+
+async def find_next_lessons(
+    group_name: str,
+    now: datetime | None = None,
+):
+    """
+    Ближайшие будущие пары.
+
+    Ищет сначала на текущей неделе, затем на следующих,
+    подгружая каждую неделю с сайта, если её нет в БД.
+    """
+
+    now = now or datetime.now()
+
+    week_start = (
+        now.date()
+        - timedelta(days=now.weekday())
+    )
+
+    for week in range(NEXT_LESSON_WEEKS_AHEAD + 1):
+
+        monday = week_start + timedelta(weeks=week)
+
+        await ensure_week_loaded(
+            group_name=group_name,
+            target_date=monday,
+        )
+
+        # Ищем до воскресенья этой недели включительно
+        days_ahead = (
+            monday
+            + timedelta(days=6)
+            - now.date()
+        ).days
+
+        lessons = await get_next_lessons(
+            group_name,
+            now,
+            days_ahead,
+        )
+
+        if lessons:
+            return lessons
+
+    return []

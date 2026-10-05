@@ -5,7 +5,6 @@ import logging
 
 from dotenv import load_dotenv
 from openai import (
-    OpenAI,
     APIConnectionError,
     APITimeoutError,
     RateLimitError,
@@ -110,7 +109,10 @@ async def create_response(**kwargs):
 
 
 
-async def ask_agent(message: str) -> str:
+async def ask_agent(
+    message: str,
+    group: str | None = None,
+) -> str:
 
 
     try:
@@ -158,7 +160,9 @@ async def ask_agent(message: str) -> str:
 
                     name=item.name,
 
-                    arguments=arguments
+                    arguments=arguments,
+
+                    group=group
                 )
 
 

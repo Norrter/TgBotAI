@@ -301,14 +301,7 @@ def get_group_url(
     return None
 
 
-def get_groups(
-    institute_url: str,
-) -> list[str]:
-    groups = load_groups_cache()
-
-    if not groups:
-        groups = build_groups_cache(
-            institute_url
-        )
-
-    return sorted(groups.keys())
+# Полная пересборка кэша групп:
+#     python -m app.parser.group_parser
+if __name__ == "__main__":
+    build_groups_cache(f"{BASE_URL}/raspisanie/")

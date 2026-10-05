@@ -1,5 +1,4 @@
 from app.assistant.client import ask_agent
-from app.assistant.context import set_group
 
 
 
@@ -34,6 +33,6 @@ async def process_message(
 - Не придумывай расписание.
 """
 
-    answer = await ask_agent(prompt)
+    answer = await ask_agent(prompt, group)
 
     return answer

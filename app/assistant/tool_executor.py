@@ -5,7 +5,6 @@ from app.assistant.tools import (
     find_teacher,
 )
 
-from app.assistant.context import get_group
 
 
 
@@ -28,27 +27,25 @@ TOOLS_MAP = {
 
 async def execute_tool(
     name: str,
-    arguments: dict
+    arguments: dict,
+    group: str | None = None,
 ):
 
     tool = TOOLS_MAP.get(name)
 
-
     if not tool:
         return "Инструмент не найден"
 
+    # Если модель не передала группу —
+    # берём группу пользователя.
+    if not arguments.get("group_name"):
 
-
-    group = get_group()
-
-
-    if group:
+        if not group:
+            return (
+                "Группа пользователя не указана. "
+                "Попроси указать её в настройках."
+            )
 
         arguments["group_name"] = group
 
-
-
-    result = await tool(**arguments)
-
-
-    return result
+    return await tool(**arguments)

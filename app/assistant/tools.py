@@ -2,78 +2,113 @@ from datetime import date, datetime, timedelta
 
 from app.database.repositories import (
     get_user_schedule,
-    get_next_lesson,
     search_lessons,
     search_lessons_by_teacher,
 )
+from app.services.schedule_loader_service import (
+    ensure_week_loaded,
+    find_current_lessons,
+    find_next_lessons,
+)
+
+
+WEEKDAYS = {
+    "понедельник": 0,
+    "вторник": 1,
+    "среда": 2,
+    "четверг": 3,
+    "пятница": 4,
+    "суббота": 5,
+    "воскресенье": 6,
+}
+
+RELATIVE_DAYS = {
+    "сегодня": 0,
+    "завтра": 1,
+    "послезавтра": 2,
+}
 
 
 def parse_date(text: str) -> date | None:
     """
-    Преобразование текста в дату
+    Преобразование текста в дату.
+
+    Понимает: сегодня / завтра / послезавтра,
+    день недели, YYYY-MM-DD и ДД.ММ.ГГГГ.
     """
 
+    text = text.strip().lower()
     today = date.today()
 
-    days = {
-        "понедельник": 0,
-        "вторник": 1,
-        "среда": 2,
-        "четверг": 3,
-        "пятница": 4,
-        "суббота": 5,
-        "воскресенье": 6,
-    }
+    if text in RELATIVE_DAYS:
+        return today + timedelta(days=RELATIVE_DAYS[text])
 
-
-    if text == "сегодня":
-        return today
-
-
-    if text == "завтра":
-        return today + timedelta(days=1)
-
-
-    if text == "послезавтра":
-        return today + timedelta(days=2)
-
-
-    if text.lower() in days:
-
-        target_weekday = days[text.lower()]
-
-        delta = (
-            target_weekday -
-            today.weekday()
-        )
+    if text in WEEKDAYS:
+        delta = WEEKDAYS[text] - today.weekday()
 
         # если день уже прошел,
         # берем следующий такой день
-
         if delta <= 0:
             delta += 7
 
         return today + timedelta(days=delta)
 
+    for date_format in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, date_format).date()
+        except ValueError:
+            continue
 
-    try:
-        return datetime.strptime(
-            text,
-            "%Y-%m-%d"
-        ).date()
-
-    except ValueError:
-        pass
+    return None
 
 
-    try:
-        return datetime.strptime(
-            text,
-            "%d.%m.%Y"
-        ).date()
+WEEKDAY_NAMES = [
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+]
 
-    except ValueError:
-        return None
+
+def describe_day(day: date) -> str:
+    """Сегодня / завтра / 12.10.2026 (понедельник)."""
+
+    delta = (day - date.today()).days
+
+    if delta == 0:
+        return "сегодня"
+
+    if delta == 1:
+        return "завтра"
+
+    return (
+        f"{day.strftime('%d.%m.%Y')} "
+        f"({WEEKDAY_NAMES[day.weekday()]})"
+    )
+
+
+def lesson_line(lesson) -> str:
+    """Одна пара одной строкой — для ответа модели."""
+
+    text = f"{lesson.time} — {lesson.subject}"
+
+    if lesson.groups:
+        text += f", группы: {lesson.groups}"
+
+    if lesson.subgroup:
+        text += f", подгруппа: {lesson.subgroup}"
+
+    if lesson.teacher:
+        text += f", преподаватель: {lesson.teacher}"
+
+    if lesson.room:
+        text += f", аудитория: {lesson.room}"
+
+    return text
+
 
 # ============================================================
 # РАСПИСАНИЕ НА ДЕНЬ
@@ -81,41 +116,22 @@ def parse_date(text: str) -> date | None:
 
 async def get_schedule_for_day(
     group_name: str,
-    target_date: str,
+    target_date: str = "сегодня",
 ):
     """
     Получить расписание группы на конкретную дату.
     """
 
-    # обработка человеческих дат
-    if target_date == "сегодня":
-        target_date = date.today()
+    target_date = parse_date(target_date)
 
-    elif target_date == "завтра":
-        target_date = date.today() + timedelta(days=1)
+    if target_date is None:
+        return "Не смог определить дату."
 
-    elif target_date == "послезавтра":
-        target_date = date.today() + timedelta(days=2)
-
-    else:
-        try:
-            parsed_date = parse_date(target_date)
-
-            if parsed_date is None:
-                return "Не смог определить дату."
-
-            target_date = parsed_date
-
-        except ValueError:
-            try:
-                target_date = datetime.strptime(
-                    target_date,
-                    "%d.%m.%Y"
-                ).date()
-
-            except ValueError:
-                return "Не смог определить дату."
-
+    # Если этой недели ещё нет в БД — загружаем её с сайта
+    await ensure_week_loaded(
+        group_name=group_name,
+        target_date=target_date,
+    )
 
     lessons = await get_user_schedule(
         group_name=group_name,
@@ -123,101 +139,63 @@ async def get_schedule_for_day(
     )
 
     if not lessons:
-        return "На этот день расписания нет."
-
-
-    result = []
-
-    for lesson in lessons:
-
-        text = (
-            f"{lesson.time} — "
-            f"{lesson.subject}"
+        return (
+            f"На {target_date.strftime('%d.%m.%Y')} "
+            f"занятий в расписании нет."
         )
-        if lesson.groups:
-            text += (
-                f", группы: "
-                f"{lesson.groups}"
-            )
-
-        if lesson.subgroup:
-            text += (
-                f", подгруппа: "
-                f"{lesson.subgroup}"
-            )
-
-        if lesson.teacher:
-            text += (
-                f", преподаватель: "
-                f"{lesson.teacher}"
-            )
-
-        if lesson.room:
-            text += (
-                f", аудитория: "
-                f"{lesson.room}"
-            )
-
-        result.append(text)
 
 
-    return "\n".join(result)
+    return "\n".join(
+        lesson_line(lesson)
+        for lesson in lessons
+    )
 
 
 
 # ============================================================
-# СЛЕДУЮЩАЯ ПАРА
+# ТЕКУЩАЯ И СЛЕДУЮЩАЯ ПАРА
 # ============================================================
 
 async def get_next_user_lesson(
     group_name: str,
 ):
     """
-    Получить ближайшую пару пользователя.
+    Получить текущую пару (если она идёт)
+    и ближайшую следующую — сегодня или в следующие дни.
     """
 
-    lesson = await get_next_lesson(
-        group_name
-    )
+    current = await find_current_lessons(group_name)
+    upcoming = await find_next_lessons(group_name)
 
+    parts = []
 
-    if lesson is None:
-        return "Сегодня больше занятий нет."
+    if current:
+        parts.append(
+            "Сейчас идёт пара:\n"
+            + "\n".join(
+                lesson_line(lesson)
+                for lesson in current
+            )
+        )
+    else:
+        parts.append("Сейчас пары нет.")
 
-
-    result = (
-        f"{lesson.time} — "
-        f"{lesson.subject}"
-    )
-
-    if lesson.groups:
-        text += (
-            f", группы: "
-            f"{lesson.groups}"
+    if upcoming:
+        parts.append(
+            f"Следующая пара — "
+            f"{describe_day(upcoming[0].date)}:\n"
+            + "\n".join(
+                lesson_line(lesson)
+                for lesson in upcoming
+            )
+        )
+    else:
+        parts.append(
+            "В ближайшие недели занятий "
+            "в расписании нет."
         )
 
-    if lesson.subgroup:
-        text += (
-            f", подгруппа: "
-            f"{lesson.subgroup}"
-        )
-
-
-    if lesson.teacher:
-        result += (
-            f", преподаватель: "
-            f"{lesson.teacher}"
-        )
-
-
-    if lesson.room:
-        result += (
-            f", аудитория: "
-            f"{lesson.room}"
-        )
-
-
-    return result
+    return "\n\n".join(parts)
 
 
 
@@ -233,6 +211,11 @@ async def find_subject(
     Найти занятия группы по названию предмета.
     Например: матанализ, программирование.
     """
+
+    await ensure_week_loaded(
+        group_name=group_name,
+        target_date=date.today(),
+    )
 
     lessons = await search_lessons(
         group_name,
@@ -285,6 +268,11 @@ async def find_teacher(
     """
 
 
+    await ensure_week_loaded(
+        group_name=group_name,
+        target_date=date.today(),
+    )
+
     lessons = await search_lessons_by_teacher(
         group_name,
         teacher,
@@ -317,5 +305,4 @@ async def find_teacher(
 
         result.append(text)
 
-    print("RESULT:", result)
     return "\n".join(result[:10])

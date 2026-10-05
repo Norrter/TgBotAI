@@ -1,6 +1,6 @@
 from datetime import date, timedelta, datetime
 
-from sqlalchemy import update, delete, select
+from sqlalchemy import select
 
 from app.database.database import async_session
 from app.database.models import Schedule, User
@@ -60,27 +60,6 @@ async def get_or_create_user(
 
 
         return user
-
-
-
-async def update_user_university(
-    telegram_id: int,
-    university: str,
-):
-
-    async with async_session() as session:
-
-        await session.execute(
-            update(User)
-            .where(
-                User.telegram_id == telegram_id
-            )
-            .values(
-                university=university
-            )
-        )
-
-        await session.commit()
 
 
 
@@ -175,33 +154,6 @@ async def save_schedule(
 
 
 # ============================================================
-# DELETE
-# ============================================================
-
-
-async def delete_schedule_for_group(
-    group_name: str,
-) -> None:
-
-
-    async with async_session() as session:
-
-
-        await session.execute(
-            delete(Schedule)
-            .where(
-                Schedule.groups.ilike(
-                    f"%{group_name}%"
-                )
-            )
-        )
-
-
-        await session.commit()
-
-
-
-# ============================================================
 # GET SCHEDULE
 # ============================================================
 
@@ -268,47 +220,101 @@ async def get_user_schedule(
 
 
 # ============================================================
-# NEXT LESSON
+# CURRENT / NEXT LESSON
 # ============================================================
 
+# Пара в ИРНИТУ длится 1 час 30 минут
+LESSON_DURATION = timedelta(minutes=90)
 
-async def get_next_lesson(
-    group_name: str,
-):
-
-    now = datetime.now()
+# На сколько дней вперёд искать ближайшую пару
+NEXT_LESSON_SEARCH_DAYS = 14
 
 
-    schedule = await get_user_schedule(
-        group_name,
-        date.today(),
+def lesson_start(lesson: Schedule) -> datetime:
+    """Дата и время начала пары."""
+
+    hour, minute = map(
+        int,
+        lesson.time.split(":")
+    )
+
+    return datetime(
+        lesson.date.year,
+        lesson.date.month,
+        lesson.date.day,
+        hour,
+        minute,
     )
 
 
-    for lesson in schedule:
+async def get_current_lessons(
+    group_name: str,
+    now: datetime | None = None,
+) -> list[Schedule]:
+    """
+    Пары, которые идут прямо сейчас.
+
+    Список, потому что у разных подгрупп
+    в одно время могут быть разные занятия.
+    """
+
+    now = now or datetime.now()
+
+    schedule = await get_user_schedule(
+        group_name,
+        now.date(),
+    )
+
+    return [
+        lesson
+        for lesson in schedule
+        if lesson_start(lesson)
+        <= now
+        < lesson_start(lesson) + LESSON_DURATION
+    ]
 
 
-        hour, minute = map(
-            int,
-            lesson.time.split(":")
+async def get_next_lessons(
+    group_name: str,
+    now: datetime | None = None,
+    days_ahead: int = NEXT_LESSON_SEARCH_DAYS,
+) -> list[Schedule]:
+    """
+    Ближайшие пары, которые ещё не начались.
+
+    Сначала проверяется сегодняшний день, затем
+    завтра и следующие дни (до days_ahead дней вперёд).
+    Возвращаются все пары ближайшего времени начала.
+    """
+
+    now = now or datetime.now()
+
+    for offset in range(days_ahead + 1):
+
+        day = now.date() + timedelta(days=offset)
+
+        schedule = await get_user_schedule(
+            group_name,
+            day,
         )
 
+        upcoming = [
+            lesson
+            for lesson in schedule
+            if lesson_start(lesson) > now
+        ]
 
-        lesson_time = now.replace(
-            hour=hour,
-            minute=minute,
-            second=0,
-            microsecond=0,
-        )
+        if upcoming:
 
+            nearest = lesson_start(upcoming[0])
 
-        if lesson_time > now:
+            return [
+                lesson
+                for lesson in upcoming
+                if lesson_start(lesson) == nearest
+            ]
 
-            return lesson
-
-
-
-    return None
+    return []
 
 
 

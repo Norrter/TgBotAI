@@ -1,7 +1,6 @@
 from datetime import date, datetime
 
 from sqlalchemy import BigInteger, Date, DateTime, String, Text
-from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -98,58 +97,3 @@ class Schedule(Base):
         DateTime,
         default=datetime.utcnow,
     )
-
-
-
-
-class Institute(Base):
-    __tablename__ = "institutes"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    name: Mapped[str] = mapped_column(
-        String(255)
-    )
-
-    url: Mapped[str] = mapped_column(
-        String(500),
-        unique=True
-    )
-
-class Group(Base):
-    __tablename__ = "groups"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    name: Mapped[str]
-
-    url: Mapped[str]
-
-    institute_id: Mapped[int]
-
-class Lesson(Base):
-    __tablename__ = "lessons"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    group_id: Mapped[int]
-
-    date: Mapped[date]
-
-    time: Mapped[str]
-
-    subject: Mapped[str]
-
-    teacher: Mapped[str | None]
-
-    room: Mapped[str | None]
-
-    lesson_type: Mapped[str | None]
-
-

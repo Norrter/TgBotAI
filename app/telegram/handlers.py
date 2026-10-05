@@ -1,5 +1,14 @@
-from datetime import date, datetime
+import html
+import re
+from datetime import date, timedelta
+
 from app.assistant.service import process_message
+from app.assistant.speech import (
+    MAX_VOICE_BYTES,
+    MAX_VOICE_SECONDS,
+    recognize_speech,
+)
+from app.assistant.tools import describe_day
 from aiogram import Router, F
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -10,13 +19,16 @@ from app.database.repositories import (
     get_or_create_user,
     update_user_group,
     get_user_schedule,
-    get_next_lesson,
     search_lessons,
     search_lessons_by_teacher,
 )
 
 from app.parser.group_parser import get_group_url
-from app.services.schedule_loader_service import ensure_week_loaded
+from app.services.schedule_loader_service import (
+    ensure_week_loaded,
+    find_current_lessons,
+    find_next_lessons,
+)
 
 from app.telegram.keyboards import (
     main_menu,
@@ -50,9 +62,6 @@ class UserStates(StatesGroup):
 
     waiting_for_teacher = State()
 
-    waiting_for_date = State()
-
-    current_schedule_date = State()
 
 
 # ============================================================
@@ -73,20 +82,6 @@ async def get_user_from_callback(callback: CallbackQuery):
         username=callback.from_user.username,
         first_name=callback.from_user.first_name,
     )
-
-
-async def get_group_for_user(message: Message):
-    user = await get_user(message)
-
-    if not user.group_name:
-        await message.answer(
-            "👥 У тебя пока не указана группа.\n\n"
-            "Зайди в ⚙️ Настройки → 👥 Моя группа "
-            "и введи название своей группы."
-        )
-        return None
-
-    return user.group_name
 
 
 def format_lesson(lesson) -> str:
@@ -135,27 +130,18 @@ async def show_schedule(
         target_date=target_date,
     )
 
-    # Если расписания нет — пробуем загрузить с сайта
+    # Если расписания нет — пробуем загрузить неделю с сайта
     if not schedule:
-        try:
-            group_url = get_group_url(
-                institute_url=INSTITUTE_URL,
+        loaded = await ensure_week_loaded(
+            group_name=group_name,
+            target_date=target_date,
+        )
+
+        if loaded:
+            schedule = await get_user_schedule(
                 group_name=group_name,
+                target_date=target_date,
             )
-
-            if group_url:
-                await ensure_week_loaded(
-                    group_name=group_name,
-                    target_date=target_date,
-                )
-
-                schedule = await get_user_schedule(
-                    group_name=group_name,
-                    target_date=target_date,
-                )
-
-        except Exception as e:
-            print(f"Ошибка загрузки расписания: {e}")
 
     await state.update_data(
         current_date=target_date.isoformat()
@@ -232,6 +218,271 @@ async def start_handler(
         reply_markup=main_menu(),
     )
 
+# ============================================================
+# ТЕКСТОВЫЕ КОМАНДЫ (меню, помощь, настройки)
+# ============================================================
+# Эти фразы обрабатываются сразу, без обращения к AI.
+# Сравнивается всё сообщение целиком (без регистра,
+# знаков препинания и эмодзи), поэтому обычные вопросы
+# вроде "какие пары завтра" сюда не попадают.
+
+MENU_PHRASES = {
+    "меню",
+    "menu",
+    "главное меню",
+    "в меню",
+    "в главное меню",
+    "на главную",
+    "главная",
+    "домой",
+    "назад",
+    "открой меню",
+    "открыть меню",
+    "покажи меню",
+    "показать меню",
+    "открой главное меню",
+    "покажи главное меню",
+    "вернись в меню",
+    "вернуться в меню",
+    "старт",
+    "начать",
+}
+
+HELP_PHRASES = {
+    "помощь",
+    "help",
+    "справка",
+    "помоги",
+    "что ты умеешь",
+    "что умеешь",
+    "что ты можешь",
+    "как пользоваться",
+    "как пользоваться ботом",
+}
+
+SETTINGS_PHRASES = {
+    "настройки",
+    "settings",
+    "открой настройки",
+    "покажи настройки",
+    "моя группа",
+    "сменить группу",
+    "изменить группу",
+    "поменять группу",
+}
+
+HELP_TEXT = (
+    "ℹ️ Как пользоваться ботом\n\n"
+    "📅 Сегодня — расписание на сегодня.\n\n"
+    "➡️ Завтра — расписание на завтра.\n\n"
+    "📆 Выбрать дату — расписание "
+    "на конкретный день.\n\n"
+    "⏭ Следующая пара — ближайшее "
+    "занятие сегодня.\n\n"
+    "🔎 Найти занятие — поиск предмета "
+    "в расписании.\n\n"
+    "👨‍🏫 Преподаватель — поиск занятий "
+    "по преподавателю.\n\n"
+    "⚙️ Настройки — изменить группу.\n\n"
+    "Для работы боту достаточно указать "
+    "только свою группу."
+)
+
+
+def normalize_phrase(text: str | None) -> str:
+    if not text:
+        return ""
+
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^\w\s]", " ", text)
+
+    return " ".join(text.split())
+
+
+def phrase_in(phrases: set[str]):
+    return F.text.func(
+        lambda text: normalize_phrase(text) in phrases
+    )
+
+
+async def send_main_menu(message: Message):
+    user = await get_user(message)
+
+    if user.group_name:
+        text = (
+            "🏠 Главное меню\n\n"
+            f"👥 Группа: {user.group_name}"
+        )
+    else:
+        text = (
+            "🏠 Главное меню\n\n"
+            "👥 Группа не указана."
+        )
+
+    await message.answer(
+        text,
+        reply_markup=main_menu(),
+    )
+
+
+async def send_help(message: Message):
+    await message.answer(
+        HELP_TEXT,
+        reply_markup=main_menu(),
+    )
+
+
+async def send_settings(message: Message):
+    user = await get_user(message)
+
+    if user.group_name:
+        text = (
+            "⚙️ Настройки\n\n"
+            f"👥 Текущая группа: {user.group_name}"
+        )
+    else:
+        text = (
+            "⚙️ Настройки\n\n"
+            "👥 Группа пока не указана."
+        )
+
+    await message.answer(
+        text,
+        reply_markup=settings_menu(),
+    )
+
+
+async def answer_with_ai(
+    message: Message,
+    text: str,
+):
+    """Отправляет вопрос в AI-помощник и отвечает пользователю."""
+
+    user = await get_user(message)
+
+    try:
+        await message.answer(
+            "⏳ Обрабатываю ваш запрос..."
+        )
+    except Exception as e:
+        print("Telegram send error:", e)
+        return
+
+    answer = await process_message(
+        text,
+        user.group_name
+    )
+
+    await message.answer(answer)
+
+
+async def handle_free_text(
+    message: Message,
+    text: str,
+):
+    """
+    Общая обработка запроса в свободной форме —
+    одинаковая для текста и распознанного голоса.
+    """
+
+    phrase = normalize_phrase(text)
+
+    if phrase in MENU_PHRASES:
+        await send_main_menu(message)
+
+    elif phrase in HELP_PHRASES:
+        await send_help(message)
+
+    elif phrase in SETTINGS_PHRASES:
+        await send_settings(message)
+
+    else:
+        await answer_with_ai(message, text)
+
+
+@router.message(phrase_in(MENU_PHRASES))
+async def menu_text_handler(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+    await send_main_menu(message)
+
+
+@router.message(phrase_in(HELP_PHRASES))
+async def help_text_handler(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+    await send_help(message)
+
+
+@router.message(phrase_in(SETTINGS_PHRASES))
+async def settings_text_handler(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+    await send_settings(message)
+
+
+# ============================================================
+# ГОЛОСОВЫЕ СООБЩЕНИЯ
+# ============================================================
+# Голосовое распознаётся через Yandex SpeechKit и дальше
+# обрабатывается так же, как обычный текстовый запрос.
+
+@router.message(F.voice)
+async def voice_message_handler(
+    message: Message,
+    state: FSMContext,
+):
+    voice = message.voice
+
+    if (
+        voice.duration > MAX_VOICE_SECONDS
+        or (voice.file_size or 0) > MAX_VOICE_BYTES
+    ):
+        await message.answer(
+            "🎤 Голосовое сообщение слишком длинное.\n\n"
+            f"Запишите вопрос короче {MAX_VOICE_SECONDS} секунд "
+            "или напишите его текстом."
+        )
+        return
+
+    status = await message.answer(
+        "🎤 Распознаю голосовое сообщение..."
+    )
+
+    try:
+        audio = await message.bot.download(voice)
+        text = await recognize_speech(audio.read())
+
+    except Exception as e:
+        print(f"❌ Ошибка распознавания речи: {e}")
+
+        await status.edit_text(
+            "❌ Не удалось распознать голосовое сообщение.\n\n"
+            "Попробуйте ещё раз или напишите вопрос текстом."
+        )
+        return
+
+    if not text:
+        await status.edit_text(
+            "🤔 Не удалось разобрать речь.\n\n"
+            "Попробуйте сказать чётче или напишите вопрос текстом."
+        )
+        return
+
+    await status.edit_text(
+        f"🎤 Вы сказали: {html.escape(text)}"
+    )
+
+    await state.clear()
+
+    await handle_free_text(message, text)
+
 
 
 # ============================================================
@@ -265,8 +516,6 @@ async def tomorrow_handler(
     state: FSMContext,
 ):
     await callback.answer()
-
-    from datetime import timedelta
 
     user = await get_user_from_callback(callback)
 
@@ -375,30 +624,31 @@ async def next_lesson_handler(
         )
         return
 
-    lesson = await get_next_lesson(
-        group_name=user.group_name
-    )
+    current = await find_current_lessons(user.group_name)
+    upcoming = await find_next_lessons(user.group_name)
 
-    if lesson is None:
-        await callback.message.answer(
-            "⏭ На сегодня больше пар нет."
+    text = ""
+
+    if current:
+        text += "▶️ Сейчас идёт\n\n"
+
+        for lesson in current:
+            text += format_lesson(lesson) + "\n"
+
+    if upcoming:
+        text += (
+            "⏭ Следующая пара — "
+            f"{describe_day(upcoming[0].date)}\n\n"
         )
-        return
 
-    text = (
-        "⏭ Следующая пара\n\n"
-        f"📚 {lesson.subject}\n"
-        f"🕐 {lesson.time}\n"
-    )
+        for lesson in upcoming:
+            text += format_lesson(lesson) + "\n"
 
-    if lesson.lesson_type:
-        text += f"📝 {lesson.lesson_type}\n"
-
-    if lesson.teacher:
-        text += f"👨‍🏫 {lesson.teacher}\n"
-
-    if lesson.room:
-        text += f"🚪 {lesson.room}\n"
+    else:
+        text += (
+            "⏭ В ближайшие недели занятий "
+            "в расписании нет."
+        )
 
     await callback.message.answer(text)
 
@@ -459,7 +709,7 @@ async def change_group_handler(
 # СОХРАНЕНИЕ ГРУППЫ
 # ============================================================
 
-@router.message(UserStates.waiting_for_group)
+@router.message(UserStates.waiting_for_group, F.text)
 async def group_input_handler(
     message: Message,
     state: FSMContext,
@@ -564,7 +814,7 @@ async def search_subject_handler(
     )
 
 
-@router.message(UserStates.waiting_for_subject)
+@router.message(UserStates.waiting_for_subject, F.text)
 async def subject_input_handler(
     message: Message,
     state: FSMContext,
@@ -581,6 +831,11 @@ async def subject_input_handler(
             reply_markup=main_menu(),
         )
         return
+
+    await ensure_week_loaded(
+        group_name=user.group_name,
+        target_date=date.today(),
+    )
 
     lessons = await search_lessons(
         group_name=user.group_name,
@@ -653,7 +908,7 @@ async def search_teacher_handler(
     )
 
 
-@router.message(UserStates.waiting_for_teacher)
+@router.message(UserStates.waiting_for_teacher, F.text)
 async def teacher_input_handler(
     message: Message,
     state: FSMContext,
@@ -670,6 +925,11 @@ async def teacher_input_handler(
             reply_markup=main_menu(),
         )
         return
+
+    await ensure_week_loaded(
+        group_name=user.group_name,
+        target_date=date.today(),
+    )
 
     lessons = await search_lessons_by_teacher(
         group_name=user.group_name,
@@ -719,22 +979,7 @@ async def help_handler(
 ):
     await callback.answer()
 
-    text = (
-        "ℹ️ Как пользоваться ботом\n\n"
-        "📅 Сегодня — расписание на сегодня.\n\n"
-        "➡️ Завтра — расписание на завтра.\n\n"
-        "📆 Выбрать дату — расписание "
-        "на конкретный день.\n\n"
-        "⏭ Следующая пара — ближайшее "
-        "занятие сегодня.\n\n"
-        "🔎 Найти занятие — поиск предмета "
-        "в расписании.\n\n"
-        "👨‍🏫 Преподаватель — поиск занятий "
-        "по преподавателю.\n\n"
-        "⚙️ Настройки — изменить группу.\n\n"
-        "Для работы боту достаточно указать "
-        "только свою группу."
-    )
+    text = HELP_TEXT
 
     await callback.message.answer(
         text,
@@ -786,55 +1031,4 @@ async def back_to_menu_handler(
 async def ai_message_handler(
     message: Message,
 ):
-
-    user = await get_user(message)
-
-    try:
-        await message.answer(
-            "⏳ Обрабатываю ваш запрос..."
-        )
-    except Exception as e:
-        print("Telegram send error:", e)
-        return
-
-
-    answer = await process_message(
-        message.text,
-        user.group_name
-    )
-
-
-    await message.answer(answer)
-
-
-
-@router.message(
-    F.text,
-    StateFilter(None),
-)
-async def ai_message_handler(
-    message: Message,
-):
-
-    user = await get_user(message)
-
-    status = await message.answer(
-        "⏳ Обрабатываю ваш запрос..."
-    )
-
-    try:
-
-        answer = await process_message(
-            message.text,
-            user.group_name
-        )
-
-        await status.edit_text(answer)
-
-    except Exception as e:
-
-        print("AI ERROR:", e)
-
-        await status.edit_text(
-            "❌ Не удалось обработать запрос. Попробуйте ещё раз."
-        )
+    await answer_with_ai(message, message.text)
